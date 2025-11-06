@@ -2,12 +2,12 @@
 
 ;; Copyright (C) 2018-2025 Free Software Foundation, Inc.
 
-;; Version: 1.18
+;; Version: 1.19
 ;; Author: João Távora <joaotavora@gmail.com>
 ;; Maintainer: João Távora <joaotavora@gmail.com>
 ;; URL: https://github.com/joaotavora/eglot
 ;; Keywords: convenience, languages
-;; Package-Requires: ((emacs "26.3") (eldoc "1.14.0") (external-completion "0.1") (flymake "1.4.1") (jsonrpc "1.0.24") (project "0.9.8") (seq "2.23") (xref "1.6.2"))
+;; Package-Requires: ((emacs "26.3") (eldoc "1.14.0") (external-completion "0.1") (flymake "1.4.2") (jsonrpc "1.0.26") (project "0.9.8") (seq "2.23") (xref "1.6.2"))
 
 ;; This is a GNU ELPA :core package.  Avoid adding functionality
 ;; that is not available in the version of Emacs recorded above or any
@@ -308,6 +308,7 @@ automatically)."
      . ,(eglot-alternatives '("digestif" "texlab")))
     (erlang-mode . ("erlang_ls" "--transport" "stdio"))
     ((yaml-ts-mode yaml-mode) . ("yaml-language-server" "--stdio"))
+    ((toml-ts-mode conf-toml-mode) . ("tombi" "lsp"))
     (nix-mode . ,(eglot-alternatives '("nil" "rnix-lsp" "nixd")))
     (nickel-mode . ("nls"))
     ((nushell-mode nushell-ts-mode) . ("nu" "--lsp"))
@@ -574,6 +575,7 @@ under cursor."
           (const :tag "Fold regions of buffer" :foldingRangeProvider)
           (const :tag "Execute custom commands" :executeCommandProvider)
           (const :tag "Inlay hints" :inlayHintProvider)
+          (const :tag "Semantic tokens" :semanticTokensProvider)
           (const :tag "Type hierarchies" :typeHierarchyProvider)
           (const :tag "Call hierarchies" :callHierarchyProvider)))
 
@@ -1293,7 +1295,7 @@ SERVER."
   (unwind-protect
       (progn
         (setf (eglot--shutdown-requested server) t)
-        (eglot--request server :shutdown eglot--{} :timeout (or timeout 1.5))
+        (eglot--request server :shutdown :jsonrpc-omit :timeout (or timeout 1.5))
         (jsonrpc-notify server :exit eglot--{}))
     ;; Now ask jsonrpc.el to shut down the server.
     (jsonrpc-shutdown server (not preserve-buffers))
@@ -2044,8 +2046,6 @@ Doubles as an indicator of snippet support."
            (apply #'yas-expand-snippet args)))))
 
 (defun eglot--format-markup (markup &optional mode)
- "Format MARKUP according to LSP's spec.
-MARKUP is either an LSP MarkedString or MarkupContent object."
  (let (string render-mode language)
    (cond ((stringp markup)
           (setq string markup
@@ -2065,7 +2065,8 @@ MARKUP is either an LSP MarkedString or MarkupContent object."
                       ("plaintext" 'text-mode)
                       (_ major-mode))))))
    (with-temp-buffer
-     (setq-local markdown-fontify-code-blocks-natively t)
+     (setq-local markdown-fontify-code-blocks-natively t
+                 markdown-fontify-code-block-default-mode major-mode)
      (insert string)
      (let ((inhibit-message t)
            (message-log-max nil)
@@ -2075,9 +2076,14 @@ MARKUP is either an LSP MarkedString or MarkupContent object."
        (goto-char (point-min))
        (let ((inhibit-read-only t))
          (when (fboundp 'text-property-search-forward)
+           ;; If `render-mode' is `gfm-view-mode', the `invisible'
+           ;; regions are set to `markdown-markup'.  Set them to 't'
+           ;; instead, since this has actual meaning in the "*eldoc*"
+           ;; buffer where we're taking this string (#bug79552).
            (while (setq match (text-property-search-forward 'invisible))
-             (delete-region (prop-match-beginning match)
-                            (prop-match-end match)))))
+             (put-text-property (prop-match-beginning match)
+                                (prop-match-end match)
+                                'invisible t))))
        (string-trim (buffer-string))))))
 
 (defun eglot--read-server (prompt &optional dont-if-just-the-one)
@@ -3783,6 +3789,8 @@ for which LSP on-type-formatting should be requested."
                                                  nil))
                               signatures "\n")
                 :echo (eglot--sig-info active-sig activeParameter t))))))
+       :error-fn (lambda (_) (funcall cb nil))
+       :timeout-fn (lambda () (funcall cb nil))
        :hint :textDocument/signatureHelp))
     t))
 
@@ -3799,6 +3807,8 @@ for which LSP on-type-formatting should be requested."
                                      (eglot--hover-info contents range))))
                          (funcall cb info
                                   :echo (and info (string-match "\n" info))))))
+       :error-fn (lambda (_) (funcall cb nil))
+       :timeout-fn (lambda () (funcall cb nil))
        :hint :textDocument/hover))
     t))
 
@@ -4631,7 +4641,8 @@ the face to use."
   "Region whose fontification is pending to be flushed.")
 
 (defun eglot--semtok-expand-flush-region (beg end)
-  "Expand the flush region to contain BEG to END."
+  "Expand the flush region to contain the lines from BEG to END."
+  (setq beg (save-excursion (goto-char beg) (eglot--bol)))
   (cl-symbol-macrolet ((r eglot--semtok-flush-region))
     (setq r (if r (cons (min beg (car r)) (max end (cdr r)))
               (cons beg end)))))
@@ -4667,6 +4678,12 @@ the face to use."
      :success-fn
      (lambda (response)
        (eglot--when-live-buffer buf
+         ;; this is to avoid requesting again, when the following sequence of events happen:
+         ;; Request tokens (1) --->
+         ;; DocumentChanged --->
+         ;; Request tokens (deferred, 2) --->
+         ;; <--- (1) Tokens   ! outdated, but should not trigger another request
+         ;; <--- (2) Tokens   ! ok
          (when (eq id eglot--versioned-identifier)
            (eglot--semtok-put-cache :documentVersion id)
            (eglot--semtok-put-cache :region final-region)
@@ -4696,7 +4713,7 @@ Also request new tokens from the server, if necessary."
          (setq end (min (point-max) (+ end (* 5 jit-lock-chunk-size)))))
        (when-let* ((beg (text-property-not-all beg end 'eglot--semtok-propertized
                                                eglot--versioned-identifier)))
-         (setq beg (prog2 (goto-char beg) (line-beginning-position)))
+         (setq beg (prog2 (goto-char beg) (eglot--bol)))
          (when (eq (get-text-property end 'eglot--semtok-propertized)
                    eglot--versioned-identifier)
            (setq end (previous-single-property-change end 'eglot--semtok-propertized nil beg)))
@@ -4728,6 +4745,7 @@ Also request new tokens from the server, if necessary."
                (modifier-faces semtok-modifier-faces)
                (modifier-cache semtok-modifier-cache))
       (eglot-current-server)
+    
     (let (beg (end (point)) tok)
       (while (and (< end limit)
                   (setq beg (text-property-not-all end limit 'eglot-semantic-token nil))
