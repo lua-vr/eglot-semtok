@@ -141,8 +141,6 @@
 (defvar company-tooltip-align-annotations)
 (defvar tramp-ssh-controlmaster-options)
 (defvar tramp-use-ssh-controlmaster-options)
-(defvar eglot-semantic-tokens-faces)
-(defvar eglot-semantic-tokens-modifier-faces)
 
 
 ;;; Obsolete aliases
@@ -663,6 +661,47 @@ This can be useful when using docker to run a language server.")
   `((1 . eglot-diagnostic-tag-unnecessary-face)
     (2 . eglot-diagnostic-tag-deprecated-face)))
 
+(eval-when-compile
+  (defconst eglot--semtok-types
+    '(("namespace" . font-lock-keyword-face)
+      ("type" . font-lock-type-face)
+      ("class" . font-lock-type-face)
+      ("enum" . font-lock-type-face)
+      ("interface" . font-lock-type-face)
+      ("struct" . font-lock-type-face)
+      ("typeParameter" . font-lock-type-face)
+      ("parameter" . font-lock-variable-name-face)
+      ("variable" . font-lock-variable-name-face)
+      ("property" . font-lock-property-use-face)
+      ("enumMember" . font-lock-constant-face)
+      ("event" . font-lock-variable-name-face)
+      ("function" . font-lock-function-name-face)
+      ("method" . font-lock-function-name-face)
+      ("macro" . font-lock-preprocessor-face)
+      ("keyword" . font-lock-keyword-face)
+      ("modifier" . font-lock-function-name-face)
+      ("comment" . font-lock-comment-face)
+      ("string" . font-lock-string-face)
+      ("number" . font-lock-constant-face)
+      ("regexp" . font-lock-string-face)
+      ("operator" . font-lock-function-name-face)
+      ("decorator" . font-lock-type-face)))
+
+  (defconst eglot--semtok-modifiers
+    '(("declaration" . font-lock-function-name-face)
+      ("definition" . font-lock-function-name-face)
+      ("readonly" . font-lock-constant-face)
+      ("static" . font-lock-keyword-face)
+      ("deprecated" . eglot-diagnostic-tag-deprecated-face)
+      ("abstract" . font-lock-keyword-face)
+      ("async" . font-lock-preprocessor-face)
+      ("modification" . font-lock-function-name-face)
+      ("documentation" . font-lock-doc-face)
+      ("defaultLibrary" . font-lock-builtin-face))))
+
+(defvar eglot-semantic-token-types) ;; forward-declare
+(defvar eglot-semantic-token-modifiers) ;; forward-declare
+
 (defvaralias 'eglot-{} 'eglot--{})
 
 (defconst eglot--{} (make-hash-table :size 0) "The empty JSON object.")
@@ -714,6 +753,7 @@ This can be useful when using docker to run a language server.")
       (ResponseError (:code :message) (:data))
       (ShowMessageParams (:type :message))
       (ShowMessageRequestParams (:type :message) (:actions))
+      (SemanticTokensLegend (:tokenTypes :tokenModifiers))
       (SignatureHelp (:signatures) (:activeSignature :activeParameter))
       (SignatureInformation (:label) (:documentation :parameters :activeParameter))
       (SymbolInformation (:name :kind :location)
@@ -1086,10 +1126,10 @@ object."
              :rename             `(:dynamicRegistration :json-false)
              :semanticTokens     `(:dynamicRegistration :json-false
                                    :requests '(:range t :full (:delta t))
-                                   :tokenModifiers [,@(mapcar #'car eglot-semantic-tokens-modifier-faces)]
                                    :overlappingTokenSupport t
                                    :multilineTokenSupport t
-                                   :tokenTypes [,@(mapcar #'car eglot-semantic-tokens-faces)]
+                                   :tokenTypes [,@eglot-semantic-token-types]
+                                   :tokenModifiers [,@eglot-semantic-token-modifiers]
                                    :formats ["relative"])
              :inlayHint          `(:dynamicRegistration :json-false)
              :callHierarchy      `(:dynamicRegistration :json-false)
@@ -1162,15 +1202,9 @@ object."
    (saved-initargs
     :documentation "Saved initargs for reconnection purposes."
     :accessor eglot--saved-initargs)
-   (semtok-faces
-    :initform nil
-    :documentation "Semantic tokens faces.")
-   (semtok-modifier-faces
-    :initform nil
-    :documentation "Semantic tokens modifier faces.")
-   (semtok-modifier-cache
-    :initform (make-hash-table)
-    :documentation "A hashmap of modifier values to the selected faces."))
+   (semtok-cache
+    :initform (make-hash-table :test #'equal)
+    :documentation "Map LSP token conses to face names."))
   :documentation
   "Represents a server. Wraps a process for LSP communication.")
 
@@ -1225,17 +1259,17 @@ TRUENAMEP indicated PATH is already a truename."
                eglot--uri-path-allowed-chars)))))
 
 (defun eglot-range-region (range &optional markers)
-  "Return a cons (BEG . END) of positions representing LSP RANGE.
+  "Convert LSP \"Range\" RANGE to cons (BEG . END) of buffer positions.
 If optional MARKERS, make markers instead."
   (let* ((st (plist-get range :start))
          (beg (eglot--lsp-position-to-point st markers))
          (end (eglot--lsp-position-to-point (plist-get range :end) markers)))
     (cons beg end)))
 
-(defun eglot-region-range (beg end)
-  "Return a LSP range representing region BEG to END."
-  (list :start (eglot--pos-to-lsp-position beg)
-        :end (eglot--pos-to-lsp-position end)))
+(defun eglot-region-range (from to)
+  "Convert FROM and TO buffer positions to an LSP \"Range\"."
+  (list :start (eglot--pos-to-lsp-position from)
+        :end (eglot--pos-to-lsp-position to)))
 
 (defun eglot-server-capable (&rest feats)
   "Determine if current server is capable of FEATS."
@@ -1602,8 +1636,7 @@ Use current server's or first available Eglot events buffer."
   (jsonrpc-forget-pending-continuations server))
 
 (defvar eglot-connect-hook
-  '(eglot-signal-didChangeConfiguration
-    eglot--semtok-initialize)
+  '(eglot-signal-didChangeConfiguration)
   "Hook run after connecting to a server.
 Each function is passed an `eglot-lsp-server' instance
 as argument.")
@@ -1924,7 +1957,13 @@ and also used as a hint of the request cancellation mechanism (see
                        moreargs))))
       (when (and hint eglot-advertise-cancellation)
         (push id
-              (plist-get eglot--inflight-async-requests hint))))))
+              (plist-get eglot--inflight-async-requests hint)))
+      id)))
+
+(cl-defun eglot--delete-overlays (&optional (prop 'eglot--overlays))
+  (eglot--widening
+   (dolist (o (overlays-in (point-min) (point-max)))
+     (when (overlay-get o prop) (delete-overlay o)))))
 
 
 ;;; Encoding fever
@@ -2018,21 +2057,19 @@ encoding and Eglot will set this variable automatically.")
 (defun eglot--lsp-position-to-point (pos-plist &optional marker)
   "Convert LSP position POS-PLIST to Emacs point.
 If optional MARKER, return a marker instead"
-  (save-excursion
-    (save-restriction
-      (widen)
-      (goto-char (point-min))
-      (forward-line (min most-positive-fixnum
-                         (plist-get pos-plist :line)))
-      (unless (eobp) ;; if line was excessive leave point at eob
-        (let ((col (plist-get pos-plist :character)))
-          (unless (wholenump col)
-            (eglot--warn
-             "Caution: LSP server sent invalid character position %s. Using 0 instead."
-             col)
-            (setq col 0))
-          (funcall eglot-move-to-linepos-function col)))
-      (if marker (copy-marker (point-marker)) (point)))))
+  (eglot--widening
+   (goto-char (point-min))
+   (forward-line (min most-positive-fixnum
+                      (plist-get pos-plist :line)))
+   (unless (eobp) ;; if line was excessive leave point at eob
+     (let ((col (plist-get pos-plist :character)))
+       (unless (wholenump col)
+         (eglot--warn
+          "Caution: LSP server sent invalid character position %s. Using 0 instead."
+          col)
+         (setq col 0))
+       (funcall eglot-move-to-linepos-function col)))
+   (if marker (copy-marker (point-marker)) (point))))
 
 
 ;;; More helpers
@@ -2046,45 +2083,46 @@ Doubles as an indicator of snippet support."
            (apply #'yas-expand-snippet args)))))
 
 (defun eglot--format-markup (markup &optional mode)
- (let (string render-mode language)
-   (cond ((stringp markup)
-          (setq string markup
-                render-mode (or mode 'gfm-view-mode)))
-         ((setq language (plist-get markup :language))
-          ;; Deprecated MarkedString
-          (setq string (concat "```" language "\n"
-                               (plist-get markup :value) "\n```")
-                render-mode (or mode 'gfm-view-mode)))
-         (t
-          ;; MarkupContent
-          (setq string (plist-get markup :value)
-                render-mode
-                (or mode
-                    (pcase (plist-get markup :kind)
-                      ("markdown" 'gfm-view-mode)
-                      ("plaintext" 'text-mode)
-                      (_ major-mode))))))
-   (with-temp-buffer
-     (setq-local markdown-fontify-code-blocks-natively t
-                 markdown-fontify-code-block-default-mode major-mode)
-     (insert string)
-     (let ((inhibit-message t)
-           (message-log-max nil)
-           match)
-       (ignore-errors (delay-mode-hooks (funcall render-mode)))
-       (font-lock-ensure)
-       (goto-char (point-min))
-       (let ((inhibit-read-only t))
-         (when (fboundp 'text-property-search-forward)
-           ;; If `render-mode' is `gfm-view-mode', the `invisible'
-           ;; regions are set to `markdown-markup'.  Set them to 't'
-           ;; instead, since this has actual meaning in the "*eldoc*"
-           ;; buffer where we're taking this string (#bug79552).
-           (while (setq match (text-property-search-forward 'invisible))
-             (put-text-property (prop-match-beginning match)
-                                (prop-match-end match)
-                                'invisible t))))
-       (string-trim (buffer-string))))))
+  "Format MARKUP according to LSP's spec.
+MARKUP is either an LSP MarkedString or MarkupContent object."
+  (let (string render-mode language)
+    (cond ((stringp markup)
+           (setq string markup
+                 render-mode (or mode 'gfm-view-mode)))
+          ((setq language (plist-get markup :language))
+           ;; Deprecated MarkedString
+           (setq string (concat "```" language "\n"
+                                (plist-get markup :value) "\n```")
+                 render-mode (or mode 'gfm-view-mode)))
+          (t
+           ;; MarkupContent
+           (setq string (plist-get markup :value)
+                 render-mode
+                 (or mode
+                     (pcase (plist-get markup :kind)
+                       ("markdown" 'gfm-view-mode)
+                       ("plaintext" 'text-mode)
+                       (_ major-mode))))))
+    (with-temp-buffer
+      (setq-local markdown-fontify-code-blocks-natively t)
+      (insert string)
+      (let ((inhibit-message t)
+            (message-log-max nil)
+            match)
+        (ignore-errors (delay-mode-hooks (funcall render-mode)))
+        (font-lock-ensure)
+        (goto-char (point-min))
+        (let ((inhibit-read-only t))
+          (when (fboundp 'text-property-search-forward)
+            ;; If `render-mode' is `gfm-view-mode', the `invisible'
+            ;; regions are set to `markdown-markup'.  Set them to 't'
+            ;; instead, since this has actual meaning in the "*eldoc*"
+            ;; buffer where we're taking this string (#bug79552).
+            (while (setq match (text-property-search-forward 'invisible))
+              (put-text-property (prop-match-beginning match)
+                                 (prop-match-end match)
+                                 'invisible t))))
+        (string-trim (buffer-string))))))
 
 (defun eglot--read-server (prompt &optional dont-if-just-the-one)
   "Read a running Eglot server from minibuffer using PROMPT.
@@ -2231,8 +2269,9 @@ Use `eglot-managed-p' to determine if current buffer is managed.")
       (eldoc-mode 1))
     (cl-pushnew (current-buffer) (eglot--managed-buffers (eglot-current-server))))
    (t
-    (mapc #'delete-overlay eglot--highlights)
-    (delete-overlay eglot--suggestion-overlay)
+    (eglot-inlay-hints-mode -1)
+    (eglot-semantic-tokens-mode -1)
+    (eglot--delete-overlays 'eglot--overlay)
     (remove-hook 'after-change-functions #'eglot--after-change t)
     (remove-hook 'before-change-functions #'eglot--before-change t)
     (remove-hook 'kill-buffer-hook #'eglot--managed-mode-off t)
@@ -2273,8 +2312,6 @@ Use `eglot-managed-p' to determine if current buffer is managed.")
 
 (defun eglot--managed-mode-off ()
   "Turn off `eglot--managed-mode' unconditionally."
-  (remove-overlays nil nil 'eglot--overlay t)
-  (eglot-inlay-hints-mode -1)
   (eglot--managed-mode -1))
 
 (defun eglot-current-server ()
@@ -2990,6 +3027,13 @@ Records BEG, END and PRE-CHANGE-LENGTH locally."
                `(,lsp-beg ,lsp-end ,pre-change-length
                           ,(buffer-substring-no-properties beg end)))))
     (_ (setf eglot--recent-changes :emacs-messup)))
+  ;; JT@2025-11-14: Not 100% sure an idle timer is right to coalesce
+  ;; multiple edits into a single didChange notification.  It allows,
+  ;; for example, user to modify the buffer in one place, spend
+  ;; arbitrary time in quick successive movement and edit again.  Only
+  ;; after the idle delay will the change be sent.  A regular timer
+  ;; would be simpler would notify the server to start processing
+  ;; changes sooner.
   (when eglot--change-idle-timer (cancel-timer eglot--change-idle-timer))
   (let ((buf (current-buffer)))
     (setq eglot--change-idle-timer
@@ -3422,8 +3466,7 @@ for which LSP on-type-formatting should be requested."
                 ((and beg end)
                  `(:textDocument/rangeFormatting
                    :documentRangeFormattingProvider
-                   (:range ,(list :start (eglot--pos-to-lsp-position beg)
-                                  :end (eglot--pos-to-lsp-position end)))))
+                   (:range ,(eglot-region-range beg end))))
                 (t
                  '(:textDocument/formatting :documentFormattingProvider nil)))))
     (eglot-server-capable-or-lose cap)
@@ -3789,8 +3832,6 @@ for which LSP on-type-formatting should be requested."
                                                  nil))
                               signatures "\n")
                 :echo (eglot--sig-info active-sig activeParameter t))))))
-       :error-fn (lambda (_) (funcall cb nil))
-       :timeout-fn (lambda () (funcall cb nil))
        :hint :textDocument/signatureHelp))
     t))
 
@@ -3803,12 +3844,12 @@ for which LSP on-type-formatting should be requested."
        :textDocument/hover (eglot--TextDocumentPositionParams)
        :success-fn (eglot--lambda ((Hover) contents range)
                      (eglot--when-buffer-window buf
-                       (let ((info (unless (seq-empty-p contents)
-                                     (eglot--hover-info contents range))))
-                         (funcall cb info
-                                  :echo (and info (string-match "\n" info))))))
-       :error-fn (lambda (_) (funcall cb nil))
-       :timeout-fn (lambda () (funcall cb nil))
+                       (let* ((info (unless (seq-empty-p contents)
+                                      (eglot--hover-info contents range)))
+                              (pos (and info (string-match "\n" info))))
+                         (while (and pos (get-text-property pos 'invisible info))
+                           (setq pos (string-match "\n" info (1+ pos))))
+                         (funcall cb info :echo pos))))
        :hint :textDocument/hover))
     t))
 
@@ -3833,6 +3874,7 @@ for which LSP on-type-formatting should be requested."
                                  (eglot-range-region range)))
                       (let ((ov (make-overlay beg end)))
                         (overlay-put ov 'face 'eglot-highlight-symbol-face)
+                        (overlay-put ov 'eglot--overlay t)
                         (overlay-put ov 'modification-hooks
                                      `(,(lambda (o &rest _) (delete-overlay o))))
                         ov)))
@@ -4063,8 +4105,7 @@ edit proposed by the server."
 (cl-defun eglot--code-action-params (&key (beg (point)) (end beg)
                                           only triggerKind)
   (list :textDocument (eglot--TextDocumentIdentifier)
-        :range (list :start (eglot--pos-to-lsp-position beg)
-                     :end (eglot--pos-to-lsp-position end))
+        :range (eglot-region-range beg end)
         :context
         `(:diagnostics
           [,@(mapcar #'eglot--diag-to-lsp-diag
@@ -4191,6 +4232,7 @@ at point.  With prefix argument, prompt for ACTION-KIND."
                (goto-char (car bounds))
                (let ((ov (make-overlay (car bounds) (cadr bounds))))
                  (overlay-put ov 'eglot--actions actions)
+                 (overlay-put ov 'eglot--overlay t)
                  (overlay-put
                   ov
                   'before-string
@@ -4410,6 +4452,13 @@ If NOERROR, return predicate, else erroring function."
 
 (cl-defun eglot--update-hints (from to)
   "Jit-lock function for Eglot inlay hints."
+  ;; XXX: We're relying on knowledge of jit-lock internals here.
+  ;; Comparing `jit-lock-context-unfontify-pos' (if non-nil) to
+  ;; `point-max' tells us whether this call to `jit-lock-functions'
+  ;; happens after `jit-lock-context-timer' has just run.
+  (when (and jit-lock-context-unfontify-pos
+             (/= jit-lock-context-unfontify-pos (point-max)))
+    (cl-return-from eglot--update-hints))
   (cl-symbol-macrolet ((region eglot--outstanding-inlay-hints-region)
                        (last-region eglot--outstanding-inlay-hints-last-region)
                        (timer eglot--outstanding-inlay-regions-timer))
@@ -4491,8 +4540,7 @@ If NOERROR, return predicate, else erroring function."
      (eglot--current-server-or-lose)
      :textDocument/inlayHint
      (list :textDocument (eglot--TextDocumentIdentifier)
-           :range (list :start (eglot--pos-to-lsp-position from)
-                        :end (eglot--pos-to-lsp-position to)))
+           :range (eglot-region-range from to))
      :success-fn (lambda (hints)
                    (eglot--when-live-buffer buf
                      (eglot--widening
@@ -4521,309 +4569,254 @@ If NOERROR, return predicate, else erroring function."
            (eglot-inlay-hints-mode -1)))
         (t
          (jit-lock-unregister #'eglot--update-hints)
-         (remove-overlays nil nil 'eglot--inlay-hint t))))
+         (eglot--delete-overlays 'eglot--inlay-hint))))
 
 
 ;;; Semantic tokens
+(defmacro eglot--semtok-define-things ()
+  (cl-flet ((def-it (name def)
+              `(defface ,(intern (format "eglot-semantic-%s-face" name))
+                 '((t (:inherit ,def)))
+                 ,(format "Face for painting a `%s' LSP semantic token" name)
+                 :group 'eglot-semantic-fontification)))
+    (let ((types (mapcar #'car eglot--semtok-types))
+          (modifiers (mapcar #'car eglot--semtok-modifiers)))
+      `(progn
+         (defgroup eglot-semantic-faces nil
+           "Faces and options for LSP semantic fontification." :group 'eglot)
+         ,@(cl-loop for (n . d) in eglot--semtok-types collect (def-it n d))
+         ,@(cl-loop for (n . d) in eglot--semtok-modifiers collect (def-it n d))
+         (defcustom eglot-semantic-token-types
+           ',types "LSP-supplied semantic types Eglot should consider."
+           :type '(set ,@(mapcar (lambda (o) `(const ,o)) types))
+           :group 'eglot-semantic-fontification)
+         (defcustom eglot-semantic-token-modifiers
+           ',modifiers "LSP-supplied semantic modifiers Eglot should consider."
+           :type '(set ,@(mapcar (lambda (o) `(const ,o)) modifiers))
+           :group 'eglot-semantic-fontification)))))
 
-(defcustom eglot-semantic-tokens-faces
-  '(("namespace" . font-lock-keyword-face)
-    ("type" . font-lock-type-face)
-    ("class" . font-lock-type-face)
-    ("enum" . font-lock-type-face)
-    ("interface" . font-lock-type-face)
-    ("struct" . font-lock-type-face)
-    ("typeParameter" . font-lock-type-face)
-    ("parameter" . font-lock-variable-name-face)
-    ("variable" . font-lock-variable-name-face)
-    ("property" . font-lock-property-use-face)
-    ("enumMember" . font-lock-constant-face)
-    ("event" . font-lock-variable-name-face)
-    ("function" . font-lock-function-name-face)
-    ("method" . font-lock-function-name-face)
-    ("macro" . font-lock-preprocessor-face)
-    ("keyword" . font-lock-keyword-face)
-    ("modifier" . font-lock-function-name-face)
-    ("comment" . font-lock-comment-face)
-    ("string" . font-lock-string-face)
-    ("number" . font-lock-constant-face)
-    ("regexp" . font-lock-string-face)
-    ("operator" . font-lock-function-name-face)
-    ("decorator" . font-lock-type-face))
-  "Alist of faces to use to highlight semantic tokens.
-Each element is a cons cell whose car is a token type name and cdr is
-the face to use."
-  :type `(alist :key-type (string :tag "Token name")
-                :value-type (choice (face :tag "Face")
-                                    (plist :tag "Face Attributes"
-                                           :key-type
-                                           (choice
-                                            ,@(mapcar
-                                               (lambda (cell)
-                                                 `(const :tag ,(capitalize
-                                                                (cdr cell))
-                                                         ,(car cell)))
-                                               face-attribute-name-alist))))))
+(eglot--semtok-define-things)
 
-(defcustom eglot-semantic-tokens-modifier-faces
-  '(("declaration" . font-lock-function-name-face)
-    ("definition" . font-lock-function-name-face)
-    ("readonly" . font-lock-constant-face)
-    ("static" . font-lock-keyword-face)
-    ("deprecated" . eglot-diagnostic-tag-deprecated-face)
-    ("abstract" . font-lock-keyword-face)
-    ("async" . font-lock-preprocessor-face)
-    ("modification" . font-lock-function-name-face)
-    ("documentation" . font-lock-doc-face)
-    ("defaultLibrary" . font-lock-builtin-face))
-  "List of face to use to highlight tokens with modifiers.
-Each element is a cons cell whose car is a modifier name and cdr is
-the face to use."
-  :type `(alist :key-type (string :tag "Token name")
-                :value-type (choice (face :tag "Face")
-                                    (plist :tag "Face Attributes"
-                                           :key-type
-                                           (choice
-                                            ,@(mapcar
-                                               (lambda (cell)
-                                                 `(const :tag ,(capitalize
-                                                                (cdr cell))
-                                                         ,(car cell)))
-                                               face-attribute-name-alist))))))
+(defun eglot--semtok-decode-token (tok)
+  "Decode TOK.  Return (NAMES . FACES).  Filter FACES via user options."
+  (with-slots (semtok-cache capabilities)
+      (eglot--current-server-or-lose)
+    (let ((probe (gethash tok semtok-cache :missing)))
+      (if (eq probe :missing)
+          (puthash
+           tok
+           (eglot--dbind ((SemanticTokensLegend) tokenTypes tokenModifiers)
+               (plist-get (plist-get capabilities :semanticTokensProvider) :legend)
+             (cl-loop
+              with tname = (aref tokenTypes (car tok))
+              for j from 0 for m across tokenModifiers
+              when (cl-plusp (logand (cdr tok) (ash 1 j)))
+                collect m into names
+                and when (member m eglot-semantic-token-modifiers)
+                  collect (intern (format "eglot-semantic-%s-face" m)) into faces
+              finally
+              (when (member tname eglot-semantic-token-types)
+                (push (intern (format "eglot-semantic-%s-face" tname)) faces))
+              (cl-return (cons (cons tname names) faces))))
+           semtok-cache)
+        probe))))
 
-(defvar-local eglot--semtok-idle-timer nil
-  "Idle timer to request full semantic tokens.")
+(defvar-local eglot--semtok-full-cache nil "A cache of the full document tokens.")
 
-(defvar-local eglot--semtok-cache nil
-  "Cache of the last response from the server.")
-
-(defsubst eglot--semtok-put-cache (k v)
-  "Set key K of `eglot-semantic-tokens--cache' to V."
-  (setq eglot--semtok-cache
-        (plist-put eglot--semtok-cache k v)))
-
-(defun eglot--semtok-ingest-range-response (response)
-  "Handle RESPONSE to semanticTokens/range request."
-  (eglot--semtok-put-cache :response response)
-  (cl-assert (plist-get eglot--semtok-cache :region)))
-
-(defun eglot--semtok-ingest-full-response (response)
-  "Handle RESPONSE to semanticTokens/full request."
-  (eglot--semtok-put-cache :response response)
-  (cl-assert (not (plist-get eglot--semtok-cache :region))))
-
-(defsubst eglot--semtok-apply-delta-edits (old-data edits)
-  "Apply EDITS obtained from full/delta request to OLD-DATA."
-  (let* ((old-token-count (length old-data))
-         (old-token-index 0)
-         (substrings))
-    (cl-loop for edit across edits do
-     (when (< old-token-index (plist-get edit :start))
-       (push (substring old-data old-token-index (plist-get edit :start)) substrings))
-     (push (plist-get edit :data) substrings)
-     (setq old-token-index (+ (plist-get edit :start) (plist-get edit :deleteCount)))
-     finally do (push (substring old-data old-token-index old-token-count) substrings))
-    (apply #'vconcat (nreverse substrings))))
-
-(defun eglot--semtok-ingest-full/delta-response (response)
-  "Handle RESPONSE to semanticTokens/full/delta request."
-  (if-let* ((edits (plist-get response :edits)))
-      (progn
-        (cl-assert (not (plist-get eglot--semtok-cache :region)))
-        (when-let* ((old-data (plist-get (plist-get eglot--semtok-cache :response) :data)))
-          (eglot--semtok-put-cache
-           :response
-           (plist-put response :data (eglot--semtok-apply-delta-edits old-data edits)))))
-    ;; server decided to send full response instead
-    (eglot--semtok-ingest-full-response response)))
-
-(defvar-local eglot--semtok-flush-region nil
-  "Region whose fontification is pending to be flushed.")
-
-(defun eglot--semtok-expand-flush-region (beg end)
-  "Expand the flush region to contain the lines from BEG to END."
-  (setq beg (save-excursion (goto-char beg) (eglot--bol)))
-  (cl-symbol-macrolet ((r eglot--semtok-flush-region))
-    (setq r (if r (cons (min beg (car r)) (max end (cdr r)))
-              (cons beg end)))))
-
-(defun eglot--semtok-request ()
-  "Send semantic tokens request to the language server."
-  (let* ((region eglot--semtok-flush-region)
-         (method :textDocument/semanticTokens/full)
-         (params (list :textDocument (eglot--TextDocumentIdentifier)))
-         (response-handler #'eglot--semtok-ingest-full-response)
-         (buf (current-buffer))
-         (id eglot--versioned-identifier)
-         (final-region))
-    (cond
-     ((and (eglot-server-capable :semanticTokensProvider :full :delta)
-           (let ((response (plist-get eglot--semtok-cache :response)))
-             (and (plist-get response :resultId) (plist-get response :data)
-                  (not (plist-get eglot--semtok-cache :region)))))
-      (setq method :textDocument/semanticTokens/full/delta)
-      (setq response-handler #'eglot--semtok-ingest-full/delta-response)
-      (setq params
-            (plist-put params :previousResultId
-                       (plist-get (plist-get eglot--semtok-cache :response) :resultId))))
-     ((and region (eglot-server-capable :semanticTokensProvider :range))
-      (setq method :textDocument/semanticTokens/range)
-      (setq final-region region)
-      (setq params
-            (plist-put params :range
-                       (eglot-region-range (car region) (cdr region))))
-      (setq response-handler #'eglot--semtok-ingest-range-response)))
-    (eglot--async-request
-     (eglot--current-server-or-lose) method params
-     :success-fn
-     (lambda (response)
-       (eglot--when-live-buffer buf
-         ;; this is to avoid requesting again, when the following sequence of events happen:
-         ;; Request tokens (1) --->
-         ;; DocumentChanged --->
-         ;; Request tokens (deferred, 2) --->
-         ;; <--- (1) Tokens   ! outdated, but should not trigger another request
-         ;; <--- (2) Tokens   ! ok
-         (when (eq id eglot--versioned-identifier)
-           (eglot--semtok-put-cache :documentVersion id)
-           (eglot--semtok-put-cache :region final-region)
-           (setq eglot--semtok-flush-region nil)
-           (funcall response-handler response)
-           (when final-region (eglot--semtok-request-full-on-idle))
-           (when region (font-lock-flush (car region) (cdr region))))))
-     :hint #'eglot--semtok-request)))
-
-(defun eglot--semtok-propertize (beg end)
-  "Update the semantic tokens text properties from BEG to END.
-Also request new tokens from the server, if necessary."
-  (if (not (and eglot--semtok-cache
-                (plist-get eglot--semtok-cache :response)
-                (eq (plist-get eglot--semtok-cache :documentVersion)
-                    eglot--versioned-identifier)
-                (if-let* ((token-region (plist-get eglot--semtok-cache :region)))
-                    (and (<= (car token-region) beg) (<= end (cdr token-region)))
-                  t)))
-      (progn (eglot--semtok-expand-flush-region beg end)
-             (eglot--semtok-request))
-    (eglot--widening
-     (with-silent-modifications
-       ;; when full tokens are available, add some margins for performance
-       (unless (plist-get eglot--semtok-cache :region)
-         (setq beg (max (point-min) (- beg (* 5 jit-lock-chunk-size))))
-         (setq end (min (point-max) (+ end (* 5 jit-lock-chunk-size)))))
-       (when-let* ((beg (text-property-not-all beg end 'eglot--semtok-propertized
-                                               eglot--versioned-identifier)))
-         (setq beg (prog2 (goto-char beg) (eglot--bol)))
-         (when (eq (get-text-property end 'eglot--semtok-propertized)
-                   eglot--versioned-identifier)
-           (setq end (previous-single-property-change end 'eglot--semtok-propertized nil beg)))
-         (let* ((data (plist-get (plist-get eglot--semtok-cache :response) :data))
-                (i-max (length data))
-                (property-beg)
-                (property-end))
-           (remove-list-of-text-properties beg end '(eglot-semantic-token))
-           (goto-char (point-min))
-           (cl-do ((i 0 (+ i 5)) (column 0)) ((>= i i-max))
-             (when (> (aref data i) 0)
-               (setq column 0)
-               (forward-line (aref data i)))
-             (unless (< (point) beg)
-               (setq column (+ column (aref data (+ i 1))))
-               (funcall eglot-move-to-linepos-function column)
-               (when (> (point) end) (cl-return))
-               (setq property-beg (point))
-               (funcall eglot-move-to-linepos-function (+ column (aref data (+ i 2))))
-               (setq property-end (point))
-               (put-text-property property-beg property-end 'eglot-semantic-token
-                                  (cons (aref data (+ i 3))
-                                        (aref data (+ i 4))))))
-           (put-text-property beg end 'eglot--semtok-propertized eglot--versioned-identifier)))))))
-
-(defun eglot--semtok-fontify-tokens (limit)
-  "Apply face property for tokens from point until LIMIT."
-  (with-slots ((faces semtok-faces)
-               (modifier-faces semtok-modifier-faces)
-               (modifier-cache semtok-modifier-cache))
-      (eglot-current-server)
-    
-    (let (beg (end (point)) tok)
-      (while (and (< end limit)
-                  (setq beg (text-property-not-all end limit 'eglot-semantic-token nil))
-                  (setq end (next-single-property-change beg 'eglot-semantic-token nil limit))
-                  (setq tok (get-text-property beg 'eglot-semantic-token)))
-        (when-let* ((face (aref faces (car tok))))
-          (add-face-text-property beg end face))
-        (let* ((code (cdr tok))
-               (faces (gethash code modifier-cache 'not-found)))
-          (when (eq faces 'not-found)
-            (setq faces (cl-loop for j from 0 below (length modifier-faces)
-                                 if (> (logand code (ash 1 j)) 0)
-                                 if (aref modifier-faces j)
-                                 collect (aref modifier-faces j)))
-            (puthash code faces modifier-cache))
-          (dolist (face faces) (add-face-text-property beg end face)))))
-    nil))
-
-(defun eglot--semtok-request-full-on-idle ()
-  "Make a full semantic tokens request after an idle timer."
-  (let* ((buf (current-buffer))
-         (fun (lambda ()
-                (eglot--when-live-buffer buf (eglot--semtok-request)))))
-    (when eglot--semtok-idle-timer (cancel-timer eglot--semtok-idle-timer))
-    (setq eglot--semtok-idle-timer (run-with-idle-timer (* 3 eglot-send-changes-idle-time) nil fun))))
+(defsubst eglot--semtok-invalidate ()
+  (eglot--widening
+   (with-silent-modifications
+     (remove-list-of-text-properties (point-min) (point-max) '(eglot--semtok-propertized)))))
 
 (cl-defmethod eglot-handle-request
   (server (_method (eql workspace/semanticTokens/refresh)))
   "Handle a semanticTokens/refresh request from SERVER."
   (dolist (buffer (eglot--managed-buffers server))
     (eglot--when-live-buffer buffer
-      (cl-incf eglot--versioned-identifier)
+      (eglot--semtok-invalidate)
       (font-lock-flush))))
-
-(defun eglot--semtok-build-face-map (identifiers faces category varname)
-  "Build map of FACES for IDENTIFIERS using CATEGORY and VARNAME."
-  (vconcat
-   (mapcar (lambda (id)
-             (let ((maybe-face (cdr (assoc id faces))))
-               (when (not maybe-face)
-                 (eglot--warn "No face has been associated to the %s `%s': consider adding a corresponding definition to %s"
-                                 category id varname))
-               maybe-face))
-           identifiers)))
-
-(defun eglot--semtok-initialize (server)
-  "Initialize SERVER for semantic tokens."
-  (cl-destructuring-bind (&key tokenTypes tokenModifiers &allow-other-keys)
-      (plist-get (plist-get (eglot--capabilities server)
-                            :semanticTokensProvider)
-                 :legend)
-    (oset server semtok-faces
-          (eglot--semtok-build-face-map
-           tokenTypes eglot-semantic-tokens-faces
-           "semantic token" "eglot-semantic-tokens-faces"))
-    (oset server semtok-modifier-faces
-          (eglot--semtok-build-face-map
-           tokenModifiers eglot-semantic-tokens-modifier-faces
-           "semantic token modifier" "eglot-semantic-tokens-modifier-faces"))))
 
 (define-minor-mode eglot-semantic-tokens-mode
   "Minor mode for fontifying buffer with LSP server's semantic tokens."
   :global nil
-  (when eglot-semantic-tokens-mode
-    (if (not (eglot-server-capable :semanticTokensProvider))
-        (eglot-semantic-tokens-mode -1)
-      (with-silent-modifications
-        (save-restriction
-          (widen)
-          (remove-list-of-text-properties
-           (point-min) (point-max) '(eglot--semtok-propertized))))
-      (jit-lock-register #'eglot--semtok-propertize)
-      (font-lock-add-keywords nil '((eglot--semtok-fontify-tokens)) 'append)
-      (font-lock-flush)))
-  (unless eglot-semantic-tokens-mode
-    (jit-lock-unregister #'eglot--semtok-propertize)
-    (font-lock-remove-keywords nil '((eglot--semtok-fontify-tokens)))
-    (font-lock-flush)))
+  (cond (eglot-semantic-tokens-mode
+         (if (not (eglot-server-capable :semanticTokensProvider))
+             (eglot-semantic-tokens-mode -1)
+           (eglot--semtok-invalidate)
+           (font-lock-add-keywords nil '((eglot--semtok-font-lock)) 'append)
+           (font-lock-flush)))
+        (t
+         (font-lock-remove-keywords nil '((eglot--semtok-font-lock)))
+         (font-lock-flush))))
+
+(defsubst eglot--semtok-apply-delta-edits (old-data edits)
+  "Apply EDITS obtained from full/delta request to OLD-DATA."
+  (cl-loop
+   for old-i = 0 then (+ (plist-get edit :start) (plist-get edit :deleteCount))
+   for edit across edits
+   when (< old-i (plist-get edit :start))
+     vconcat (substring old-data old-i (plist-get edit :start)) into new
+   vconcat (plist-get edit :data) into new
+   finally
+   (cl-return (vconcat new (substring old-data old-i (length old-data))))))
+
+(defvar-local eglot--semtok-idle-timer nil
+  "Idle timer to request full semantic tokens.")
+
+(defun eglot--semtok-request-fullish-on-idle (buf)
+  "Make a full semantic tokens request after an idle timer."
+  (when eglot--semtok-idle-timer (cancel-timer eglot--semtok-idle-timer))
+  (setq eglot--semtok-idle-timer
+        (run-with-idle-timer
+         (* 3 eglot-send-changes-idle-time) nil
+         (lambda ()
+           (eglot--when-live-buffer buf
+             (eglot--semtok-request))))))
+
+(defvar-local eglot--semtok-inflight-regions nil
+  "Regions for an in-flight fullish request which are pending to be flushed.")
+
+(cl-defun eglot--semtok-request
+    (&optional beg end &aux
+         (server (eglot--current-server-or-lose))
+         (buf (current-buffer)))
+  "Send semantic tokens request to the language server."
+  (cl-labels
+      ((fullish-p (m)
+         (memq m '(:textDocument/semanticTokens/full/delta
+                   :textDocument/semanticTokens/full)))
+       (find-i-bol-pos (data index)
+         (eglot--widening
+          (goto-char (point-min))
+          (cl-loop for i from 0 to index by 5
+                   when (> (aref data i) 0) do
+                   (forward-line (aref data i)))
+          (point)))
+       (delta-beg (old-data edits)
+         (unless (length= edits 0)
+           (find-i-bol-pos old-data (plist-get (aref edits 0) :start))))
+       (cleanup () (setq eglot--semtok-inflight-regions nil))
+       (req (method params)
+         (when (and beg end (fullish-p method))
+           (push (cons beg end) eglot--semtok-inflight-regions))
+         (eglot--async-request
+          server method params
+          :success-fn
+          (lambda (response)
+            (eglot--when-live-buffer buf
+              (let ((docver eglot--versioned-identifier))
+                (if (fullish-p method)
+                    (let* ((edits (plist-get response :edits))
+                           (old-data (plist-get eglot--semtok-full-cache :data))
+                           (regions eglot--semtok-inflight-regions))
+                      (cleanup)
+                      (setq eglot--semtok-full-cache
+                            (list :docver docver
+                                  :resultId (plist-get response :resultId)
+                                  :data (if (and edits old-data)
+                                            (eglot--semtok-apply-delta-edits old-data edits)
+                                          (plist-get response :data))))
+                      (when (and edits old-data)
+                        ;; For a delta request, we extend the first region if necessary.
+                        (when-let* ((dbeg (delta-beg old-data edits))
+                                    (fst (car-safe regions)))
+                          (setcar fst (min dbeg (car fst)))))
+                      (cl-loop for (b . e) in regions do
+                               (jsonrpc--debug server "flush: fontify %s - %s" b e)
+                               (font-lock-flush b e)))
+                  ;; Range response. Apply to the buffer immediately.
+                  (eglot--semtok-propertize beg end (plist-get response :data) docver)
+                  (eglot--semtok-request-fullish-on-idle buf)
+                  (font-lock-flush beg end)))))
+          :error-fn (lambda (_) (cleanup))
+          :timeout-fn (lambda () (cleanup))
+          ;; For "range" requests, make sure we have one unique request per range.
+          :hint (if (fullish-p method) method
+                  (let ((name (intern (format "%s-%s-%s" (symbol-name method) beg end))))
+                    (jsonrpc--debug server "%s" name)
+                    name)))))
+    (when (and beg end eglot--semtok-inflight-regions)
+      (push (cons beg end) eglot--semtok-inflight-regions)
+      (cl-return-from eglot--semtok-request 'skipped))
+    (cond
+     ((and (eglot-server-capable :semanticTokensProvider :full :delta)
+           (when-let* ((id (plist-get eglot--semtok-full-cache :resultId)))
+             (req :textDocument/semanticTokens/full/delta
+                  (list :textDocument (eglot--TextDocumentIdentifier)
+                        :previousResultId id)))))
+     ((and beg end (eglot-server-capable :semanticTokensProvider :range))
+      (req :textDocument/semanticTokens/range
+           (list :textDocument (eglot--TextDocumentIdentifier)
+                 :range (eglot-region-range beg end))))
+     (t
+      (req :textDocument/semanticTokens/full
+           (list :textDocument (eglot--TextDocumentIdentifier)))))))
+
+(cl-defun eglot--semtok-font-lock
+    (limit &aux
+           (beg (point)) (end limit)
+           (docver eglot--versioned-identifier))
+  ""
+  ;; Determine the region where properties are missing, if any.
+  (when-let* ((missing-beg (text-property-not-all beg end
+                                                  'eglot--semtok-propertized docver))
+              (missing-end end))
+    (when (eq (get-text-property end 'eglot--semtok-propertized) docver)
+      (setq missing-end (previous-single-property-change
+                         end 'eglot--semtok-propertized nil beg)))
+    ;; The missing-* region is not propertized. Try to use the full cache.
+    (if (eq (plist-get eglot--semtok-full-cache :docver) docver)
+        (eglot--semtok-propertize missing-beg missing-end
+                                  (plist-get eglot--semtok-full-cache :data)
+                                  docver)
+      ;; Otherwise, request the region.
+      (eglot--semtok-request missing-beg missing-end)))
+  ;; Always fontify what is possible, even if outdated.
+  (eglot--semtok-font-lock-1 beg end))
+
+(defun eglot--semtok-propertize (beg end data docver)
+  "Paint semantic token properties for DATA from BEG to END."
+  (eglot--widening
+   (with-silent-modifications
+     (remove-list-of-text-properties beg end '(eglot--semtok-token
+                                               eglot--semtok-faces))
+     (cl-loop
+      with beg-bol = (progn (goto-char beg) (eglot--bol))
+      with column = 0 with p-beg = 0 with p-end = 0
+      initially (goto-char (point-min))
+      for i from 0 below (length data) by 5
+      when (> (aref data i) 0) do
+        (setq column 0)
+        (forward-line (aref data i))
+      unless (< (point) beg-bol) do
+        (setq column (+ column (aref data (+ i 1))))
+        (funcall eglot-move-to-linepos-function column)
+        (when (> (point) end) (cl-return))
+        (setq p-beg (point))
+        (funcall eglot-move-to-linepos-function (+ column (aref data (+ i 2))))
+        (setq p-end (point))
+        (let* ((tok (cons (aref data (+ i 3))
+                          (aref data (+ i 4))))
+               (decoded (eglot--semtok-decode-token tok)))
+          ;; The `eglot--semtok-names' prop doesn't serve much purpose:
+          ;; just for debug...
+          (put-text-property p-beg p-end 'eglot--semtok-names (car decoded))
+          (put-text-property p-beg p-end 'eglot--semtok-faces (cdr decoded))))
+     (jsonrpc--debug (eglot-current-server) "propertized: %s %s" beg end)
+     (put-text-property beg end 'eglot--semtok-propertized docver))))
+
+(defun eglot--semtok-font-lock-1 (beg end)
+  "Apply `eglot--semtok-faces' property into `face'."
+  (eglot--widening
+   (with-silent-modifications
+     (save-excursion
+       (cl-loop
+        initially (goto-char beg)
+        for match = (text-property-search-forward 'eglot--semtok-faces)
+        while (and match (< (point) end))
+        do (dolist (f (prop-match-value match))
+             (add-face-text-property
+              (prop-match-beginning match) (prop-match-end match) f)))))))
 
 
 ;;; Call and type hierarchies
