@@ -4623,18 +4623,23 @@ If NOERROR, return predicate, else erroring function."
 
 (defvar-local eglot--semtok-full-cache nil "A cache of the full document tokens.")
 
+(defvar-local eglot--semtok-inflight-regions nil
+  "Regions for an in-flight fullish request which are pending to be flushed.")
+
 (defsubst eglot--semtok-invalidate ()
+  (setq eglot--semtok-full-cache
+        (plist-put eglot--semtok-full-cache :docver nil))
   (eglot--widening
    (with-silent-modifications
-     (remove-list-of-text-properties (point-min) (point-max) '(eglot--semtok-propertized)))))
+     (remove-list-of-text-properties (point-min) (point-max) '(eglot--semtok-propertized)))
+   (font-lock-flush)))
 
 (cl-defmethod eglot-handle-request
   (server (_method (eql workspace/semanticTokens/refresh)))
   "Handle a semanticTokens/refresh request from SERVER."
   (dolist (buffer (eglot--managed-buffers server))
     (eglot--when-live-buffer buffer
-      (eglot--semtok-invalidate)
-      (font-lock-flush))))
+      (eglot--semtok-invalidate))))
 
 (define-minor-mode eglot-semantic-tokens-mode
   "Minor mode for fontifying buffer with LSP server's semantic tokens."
@@ -4642,9 +4647,8 @@ If NOERROR, return predicate, else erroring function."
   (cond (eglot-semantic-tokens-mode
          (if (not (eglot-server-capable :semanticTokensProvider))
              (eglot-semantic-tokens-mode -1)
-           (eglot--semtok-invalidate)
            (font-lock-add-keywords nil '((eglot--semtok-font-lock)) 'append)
-           (font-lock-flush)))
+           (eglot--semtok-invalidate)))
         (t
          (font-lock-remove-keywords nil '((eglot--semtok-font-lock)))
          (font-lock-flush))))
@@ -4671,16 +4675,16 @@ If NOERROR, return predicate, else erroring function."
          (* 3 eglot-send-changes-idle-time) nil
          (lambda ()
            (eglot--when-live-buffer buf
-             (eglot--semtok-request))))))
-
-(defvar-local eglot--semtok-inflight-regions nil
-  "Regions for an in-flight fullish request which are pending to be flushed.")
+             (unless (eq (plist-get eglot--semtok-full-cache :docver)
+                         eglot--versioned-identifier)
+               (eglot--semtok-request)))))))
 
 (cl-defun eglot--semtok-request
     (&optional beg end &aux
          (server (eglot--current-server-or-lose))
          (buf (current-buffer)))
   "Send semantic tokens request to the language server."
+  (jsonrpc--debug (eglot-current-server) "requested: %s %s" beg end)
   (cl-labels
       ((fullish-p (m)
          (memq m '(:textDocument/semanticTokens/full/delta
@@ -4688,7 +4692,7 @@ If NOERROR, return predicate, else erroring function."
        (find-i-bol-pos (data index)
          (eglot--widening
           (goto-char (point-min))
-          (cl-loop for i from 0 to index by 5
+          (cl-loop for i from 0 below index by 5
                    when (> (aref data i) 0) do
                    (forward-line (aref data i)))
           (point)))
@@ -4697,46 +4701,54 @@ If NOERROR, return predicate, else erroring function."
            (find-i-bol-pos old-data (plist-get (aref edits 0) :start))))
        (cleanup () (setq eglot--semtok-inflight-regions nil))
        (req (method params)
-         (when (and beg end (fullish-p method))
+         (when (fullish-p method)
            (push (cons beg end) eglot--semtok-inflight-regions))
          (eglot--async-request
           server method params
           :success-fn
           (lambda (response)
             (eglot--when-live-buffer buf
-              (let ((docver eglot--versioned-identifier))
-                (if (fullish-p method)
-                    (let* ((edits (plist-get response :edits))
-                           (old-data (plist-get eglot--semtok-full-cache :data))
-                           (regions eglot--semtok-inflight-regions))
-                      (cleanup)
-                      (setq eglot--semtok-full-cache
-                            (list :docver docver
-                                  :resultId (plist-get response :resultId)
-                                  :data (if (and edits old-data)
-                                            (eglot--semtok-apply-delta-edits old-data edits)
-                                          (plist-get response :data))))
-                      (when (and edits old-data)
-                        ;; For a delta request, we extend the first region if necessary.
-                        (when-let* ((dbeg (delta-beg old-data edits))
-                                    (fst (car-safe regions)))
-                          (setcar fst (min dbeg (car fst)))))
-                      (cl-loop for (b . e) in regions do
-                               (jsonrpc--debug server "flush: fontify %s - %s" b e)
-                               (font-lock-flush b e)))
-                  ;; Range response. Apply to the buffer immediately.
-                  (eglot--semtok-propertize beg end (plist-get response :data) docver)
-                  (eglot--semtok-request-fullish-on-idle buf)
-                  (font-lock-flush beg end)))))
+              ;; lua-vr@2025-11-19: If eglot--recent-changes is non-nil,
+              ;; it means there are changes pending to be sent even if
+              ;; the versioned identifier has already been incremented.
+              ;; The server does not know about such changes, so the
+              ;; response we got is outdated. We discard the response
+              ;; and just flush the regions.
+              (unless eglot--recent-changes
+                (let ((docver eglot--versioned-identifier))
+                  (if (fullish-p method)
+                      (let* ((edits (plist-get response :edits))
+                             (old-data (plist-get eglot--semtok-full-cache :data))
+                             (new-data (if (and edits old-data)
+                                           (eglot--semtok-apply-delta-edits old-data edits)
+                                         (plist-get response :data))))
+                        (setq eglot--semtok-full-cache
+                              (list :docver docver
+                                    :resultId (plist-get response :resultId)
+                                    :data new-data))
+                        (when (and edits old-data)
+                          ;; For a delta request, we extend the first region if necessary.
+                          (when-let* ((dbeg (delta-beg old-data edits))
+                                      (fst (car-safe eglot--semtok-inflight-regions))
+                                      (_ (car fst)))
+                            (jsonrpc--debug server "extending beg for delta: %s -> %s" (car fst) dbeg)
+                            (setcar fst (min dbeg (car fst))))))
+                    ;; Range response. Apply to the buffer immediately.
+                    (eglot--semtok-propertize beg end (plist-get response :data) docver)
+                    (eglot--semtok-request-fullish-on-idle buf))))
+              (if (fullish-p method)
+                  (cl-loop for (b . e) in eglot--semtok-inflight-regions
+                           when (and b e (< b e)) do (font-lock-flush b e)
+                           finally (cleanup))
+                (font-lock-flush beg end))))
           :error-fn (lambda (_) (cleanup))
           :timeout-fn (lambda () (cleanup))
           ;; For "range" requests, make sure we have one unique request per range.
           :hint (if (fullish-p method) method
-                  (let ((name (intern (format "%s-%s-%s" (symbol-name method) beg end))))
-                    (jsonrpc--debug server "%s" name)
-                    name)))))
-    (when (and beg end eglot--semtok-inflight-regions)
-      (push (cons beg end) eglot--semtok-inflight-regions)
+                  (intern (format "%s-%s-%s" (symbol-name method) beg end))))))
+    (when eglot--semtok-inflight-regions
+      (when (and beg end)
+        (push (cons beg end) eglot--semtok-inflight-regions))
       (cl-return-from eglot--semtok-request 'skipped))
     (cond
      ((and (eglot-server-capable :semanticTokensProvider :full :delta)
@@ -4757,13 +4769,12 @@ If NOERROR, return predicate, else erroring function."
            (beg (point)) (end limit)
            (docver eglot--versioned-identifier))
   ""
+  (jsonrpc--debug (eglot-current-server) "font-lock: %s %s" beg end)
   ;; Determine the region where properties are missing, if any.
-  (when-let* ((missing-beg (text-property-not-all beg end
-                                                  'eglot--semtok-propertized docver))
+  (when-let* ((missing-beg (text-property-not-all
+                            beg end 'eglot--semtok-propertized docver))
               (missing-end end))
-    (when (eq (get-text-property end 'eglot--semtok-propertized) docver)
-      (setq missing-end (previous-single-property-change
-                         end 'eglot--semtok-propertized nil beg)))
+    (jsonrpc--debug (eglot-current-server) "missing: %s %s" missing-beg missing-end)
     ;; The missing-* region is not propertized. Try to use the full cache.
     (if (eq (plist-get eglot--semtok-full-cache :docver) docver)
         (eglot--semtok-propertize missing-beg missing-end
@@ -4772,7 +4783,8 @@ If NOERROR, return predicate, else erroring function."
       ;; Otherwise, request the region.
       (eglot--semtok-request missing-beg missing-end)))
   ;; Always fontify what is possible, even if outdated.
-  (eglot--semtok-font-lock-1 beg end))
+  (eglot--semtok-font-lock-1 beg end)
+  nil)
 
 (defun eglot--semtok-propertize (beg end data docver)
   "Paint semantic token properties for DATA from BEG to END."
